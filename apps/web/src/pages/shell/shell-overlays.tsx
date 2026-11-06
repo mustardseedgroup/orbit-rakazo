@@ -92,6 +92,7 @@ export function SettingsOverlays({
   spaces,
   renameSpace,
   removeSpace,
+  leftSpace,
   refreshSpaces,
   openAgentImport,
   alive,
@@ -115,6 +116,7 @@ export function SettingsOverlays({
   spaces: Space[];
   renameSpace: (spaceId: string, name: string) => Promise<void>;
   removeSpace: (spaceId: string) => Promise<void>;
+  leftSpace: (spaceId: string, activeSpaceId: string) => Promise<void>;
   refreshSpaces: () => Promise<void>;
   openAgentImport: () => void;
   alive: RefObject<boolean>;
@@ -139,12 +141,17 @@ export function SettingsOverlays({
     <>
       {overlay?.kind === "settings" && showSettings ? (
         <SettingsOverlay
+          shellRpc={rpc}
           space={settingsSpace}
           spaces={spaces}
           onRenameSpace={renameSpace}
           onDeleteSpace={async (spaceId) => {
             await removeSpace(spaceId);
             if (alive.current) setOverlay(null);
+          }}
+          onLeftSpace={(spaceId, activeSpaceId) => {
+            setOverlay(null);
+            void leftSpace(spaceId, activeSpaceId);
           }}
           onOpenSpace={(spaceId) => setOverlay({ ...overlay, section: "space", spaceId })}
           name={user?.name ?? ""}
@@ -158,6 +165,7 @@ export function SettingsOverlays({
           onSectionChange={(section) => setOverlay({ ...overlay, section })}
           billingEnabled={bootstrapMe?.billingEnabled === true}
           sandboxProvider={bootstrapMe?.sandboxProvider}
+          computerSettingsEnabled={bootstrapMe?.computerSettingsEnabled === true}
           canConfigureComputers={bootstrapMe?.isAdmin === true}
           onSandboxProviderChange={(sandboxProvider) =>
             setBootstrapMe((prev) => (prev ? { ...prev, sandboxProvider } : prev))

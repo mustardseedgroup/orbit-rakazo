@@ -4,6 +4,7 @@ import type { Prisma, RunLease } from "@rakazo/db";
 import {
   appendEventInTransaction,
   createThreadMessageInTransaction,
+  THREAD_LOCK_TRANSACTION_OPTIONS,
   withTransactionRetry,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
@@ -43,9 +44,11 @@ export function redactBlocks(blocks: MessageBlock[], secrets: string[]): Message
     if (block.kind === "steps") {
       return {
         ...block,
-        steps: block.steps.map((step) =>
-          step.note === undefined ? step : { ...step, note: redactSecrets(step.note, secrets) },
-        ),
+        steps: block.steps.map((step) => ({
+          ...step,
+          label: redactSecrets(step.label, secrets),
+          ...(step.note === undefined ? {} : { note: redactSecrets(step.note, secrets) }),
+        })),
       };
     }
     return block;
@@ -105,7 +108,7 @@ export async function publishMessage(
         Boolean(stoppedHelper),
         lease,
       );
-    }),
+    }, THREAD_LOCK_TRANSACTION_OPTIONS),
   );
   await deps.events
     .notify(run.threadId, committed.eventSeq, committed.firstResponseRunId)
