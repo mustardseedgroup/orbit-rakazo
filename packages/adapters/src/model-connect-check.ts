@@ -1,7 +1,7 @@
 import type { Context } from "@earendil-works/pi-ai";
-import { Type } from "@earendil-works/pi-ai";
 import type { AgentRunModel } from "@rakazo/adapter-kit";
 import { MODEL_REQUEST_LIMIT_ERROR, normalizeRunError } from "@rakazo/core";
+import { Type } from "typebox";
 import { withChatCompletionsCompatibility } from "./chat-completions-compat.js";
 import { withCloudflareAuth } from "./cloudflare-ai-gateway.js";
 import { resolveRuntimeModel } from "./pi-runtime-models.js";
@@ -36,7 +36,7 @@ const BLOCKING_KINDS = new Set(["auth", "access", "model", "key", "credit", "spe
 export async function verifyModelServesAgents(
   config: Pick<
     AgentRunModel,
-    "provider" | "id" | "apiKey" | "accountId" | "gatewayId" | "maxTokens"
+    "provider" | "id" | "apiKey" | "accountId" | "gatewayId" | "projectId" | "region" | "maxTokens"
   >,
   options: { fetch?: typeof globalThis.fetch; signal?: AbortSignal } = {},
 ): Promise<void> {

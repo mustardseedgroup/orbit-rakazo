@@ -24,7 +24,229 @@ function stubSelectedSpace(id: string) {
   return (next: string) => store.set("rakazo:space-id", next);
 }
 
+function stubAudio(play: (audio: { onended: (() => void) | null }) => Promise<void>) {
+  const elements: Array<{ src: string }> = [];
+  vi.stubGlobal(
+    "Audio",
+    class {
+      src = "";
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        elements.push(this);
+      }
+      play() {
+        return play(this);
+      }
+      pause() {}
+      removeAttribute() {
+        this.src = "";
+      }
+      load() {}
+    },
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () => new Response(new Blob(["audio"]), { headers: { "content-type": "audio/mpeg" } }),
+    ),
+  );
+  vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:voice");
+  vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+  return elements;
+}
+
 describe("Speaker", () => {
+  it("plays every clip through the element a tap unlocked", async () => {
+    const played: string[] = [];
+    const elements = stubAudio((audio) => {
+      played.push((audio as unknown as { src: string }).src);
+      if (!(audio as unknown as { src: string }).src.startsWith("data:")) {
+        queueMicrotask(() => audio.onended?.());
+      }
+      return Promise.resolve();
+    });
+    const speaker = new Speaker();
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockResolvedValue(["Hello.", "Again."]);
+
+    speaker.unlock();
+    await expect(speaker.speak("Hello. Again.")).resolves.toBeUndefined();
+
+    expect(elements).toHaveLength(1);
+    expect(played).toEqual([expect.stringMatching(/^data:audio\/wav/), "blob:voice", "blob:voice"]);
+    expect(speaker.state).toEqual({ status: "idle" });
+  });
+
+  it("records the voice the server substituted, and clears it on the next clip", async () => {
+    stubAudio((audio) => {
+      if (!(audio as unknown as { src: string }).src.startsWith("data:")) {
+        queueMicrotask(() => audio.onended?.());
+      }
+      return Promise.resolve();
+    });
+    const substituted = vi.fn().mockImplementation(
+      async () =>
+        new Response(new Blob(["audio"]), {
+          headers: { "content-type": "audio/mpeg", "x-voice-id": "Vivian" },
+        }),
+    );
+    const plain = vi.fn(
+      async () => new Response(new Blob(["audio"]), { headers: { "content-type": "audio/mpeg" } }),
+    );
+    const speaker = new Speaker();
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockResolvedValue(["Hello."]);
+
+    vi.stubGlobal("fetch", substituted);
+    await speaker.speak("Hello.", { voiceId: "alloy" });
+    expect(speaker.substitutedVoice).toBe("Vivian");
+
+    vi.stubGlobal("fetch", plain);
+    await speaker.speak("Hello.", { voiceId: "Vivian" });
+    expect(speaker.substitutedVoice).toBeNull();
+  });
+
+  it("does not report a substitution when the server echoes the requested voice", async () => {
+    stubAudio((audio) => {
+      if (!(audio as unknown as { src: string }).src.startsWith("data:")) {
+        queueMicrotask(() => audio.onended?.());
+      }
+      return Promise.resolve();
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(new Blob(["audio"]), {
+            headers: { "content-type": "audio/mpeg", "x-voice-id": "Vivian" },
+          }),
+      ),
+    );
+    const speaker = new Speaker();
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockResolvedValue(["Hello."]);
+
+    await speaker.speak("Hello.", { voiceId: "Vivian" });
+    expect(speaker.substitutedVoice).toBeNull();
+  });
+
+  it("does not let a superseded clip report a later clip's voice", async () => {
+    stubAudio((audio) => {
+      if (!(audio as unknown as { src: string }).src.startsWith("data:")) {
+        queueMicrotask(() => audio.onended?.());
+      }
+      return Promise.resolve();
+    });
+    const speaker = new Speaker();
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockResolvedValue(["Hello."]);
+    let releaseFirst: (() => void) | null = null;
+    const fetchMock = vi.fn(async () => {
+      if (fetchMock.mock.calls.length === 1) {
+        return new Promise<Response>((resolve) => {
+          releaseFirst = () =>
+            resolve(
+              new Response(new Blob(["audio"]), {
+                headers: { "content-type": "audio/mpeg", "x-voice-id": "Vivian" },
+              }),
+            );
+        });
+      }
+      return new Response(new Blob(["audio"]), {
+        headers: { "content-type": "audio/mpeg", "x-voice-id": "Serena" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = speaker.speak("Hello.", { voiceId: "alloy" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await speaker.speak("Hello.", { voiceId: "alloy" });
+    expect(speaker.substitutedVoice).toBe("Serena");
+
+    (releaseFirst as unknown as () => void)();
+    await expect(first).resolves.toBeUndefined();
+  });
+
+  it("unlocks from a tap while other speech is still preparing, but never over a playing clip", async () => {
+    const played: string[] = [];
+    stubAudio((audio) => {
+      played.push((audio as unknown as { src: string }).src);
+      return new Promise(() => undefined);
+    });
+    const speaker = new Speaker();
+    let prepared!: (utterances: string[]) => void;
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          prepared = resolve;
+        }),
+    );
+
+    const pending = speaker.speak("Hello.");
+    expect(speaker.state.status).toBe("preparing");
+    speaker.unlock();
+    expect(played).toEqual([expect.stringMatching(/^data:audio\/wav/)]);
+
+    prepared(["Hello."]);
+    await vi.waitFor(() => expect(speaker.state.status).toBe("speaking"));
+    speaker.unlock();
+    expect(played).toEqual([expect.stringMatching(/^data:audio\/wav/), "blob:voice"]);
+
+    speaker.stop();
+    await pending;
+  });
+
+  it("reports a clip the browser cannot play", async () => {
+    stubAudio(() => Promise.reject(new DOMException("Unsupported", "NotSupportedError")));
+    const speaker = new Speaker();
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockResolvedValue(["Hello."]);
+
+    await expect(speaker.speak("Hello.")).resolves.toBe("Could not play that clip.");
+    expect(speaker.state.error).toBe("Could not play that clip.");
+  });
+
+  it("shows a blocked autoplay in the speech state without returning it for a toast", async () => {
+    stubAudio(() => Promise.reject(new DOMException("Not allowed", "NotAllowedError")));
+    const speaker = new Speaker();
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockResolvedValue(["Hello."]);
+
+    await expect(speaker.speak("Hello.")).resolves.toBeUndefined();
+    expect(speaker.state.error).toBe("Could not play that clip.");
+  });
+
+  it("does not report a clip stopped while it plays", async () => {
+    stubAudio(() => new Promise(() => undefined));
+    const speaker = new Speaker();
+    vi.spyOn(
+      speaker as unknown as { prepare: () => Promise<string[]> },
+      "prepare",
+    ).mockResolvedValue(["Hello."]);
+
+    const pending = speaker.speak("Hello.");
+    await vi.waitFor(() => expect(speaker.state.status).toBe("speaking"));
+    speaker.stop();
+    await expect(pending).resolves.toBeUndefined();
+    expect(speaker.state).toEqual({ status: "idle" });
+  });
+
   it("interrupting before audio arrives leaves the speaker idle", async () => {
     const speaker = new Speaker();
     vi.spyOn(
@@ -87,6 +309,8 @@ describe("Speaker", () => {
           return Promise.resolve();
         }
         pause() {}
+        removeAttribute() {}
+        load() {}
       },
     );
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:voice");

@@ -8,6 +8,9 @@ import { rpc } from "./api";
 import { queryClient, rpcQuery } from "./query";
 import { saveBotRoutine, useBotRoutines } from "./routine-store";
 
+vi.mock("./api-server", () => ({}));
+vi.mock("./api-auth", () => ({}));
+vi.mock("./api-live", () => ({}));
 vi.mock("./api", () => ({
   rpc: vi.fn(),
   currentApiBase: () => "https://api.example",
@@ -15,7 +18,8 @@ vi.mock("./api", () => ({
   captureApiRequestContext: async () => ({}),
 }));
 vi.mock("./session", () => ({ currentSessionGeneration: () => 1 }));
-vi.mock("expo-router", () => ({ useFocusEffect: () => {} }));
+vi.mock("expo-router", () => ({ useFocusEffect: () => {}, useIsFocused: () => true }));
+vi.mock("./roster-signals", () => ({ useSpaceChanges: () => {} }));
 
 const routine = { id: "routine-1", createdAt: "2026-10-01T00:00:00Z", scheduleDelayed: true };
 const key = rpcQuery("routines/list", { botId: "bot-1" }).queryKey;

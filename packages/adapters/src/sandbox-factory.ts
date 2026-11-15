@@ -1,9 +1,6 @@
-import type { ComputerRef, SandboxProvider } from "@rakazo/adapter-kit";
+import type { ComputerRef, SandboxProvider, UnreferencedMachineRecords } from "@rakazo/adapter-kit";
 import { SandboxKind } from "@rakazo/contracts";
-import { BoatSandboxProvider } from "./boat-sandbox.js";
-import { BoxdSandboxProvider } from "./boxd-sandbox.js";
 import { CreateOSSandboxProvider } from "./createos-sandbox.js";
-import { DaytonaSandboxProvider } from "./daytona-sandbox.js";
 import { assertHostCommandsAllowed, DesktopSandboxProvider } from "./desktop-sandbox.js";
 import { DockerSandboxProvider } from "./docker-sandbox.js";
 import { E2BSandboxProvider } from "./e2b-sandbox.js";
@@ -26,6 +23,8 @@ export interface SandboxProviderOptions {
   onUnsafeStop?: (providerRef: string) => Promise<void>;
   /** Whether another running computer still uses the same provider resource. */
   referenceInUse?: (computer: ComputerRef) => Promise<boolean>;
+  /** Keeps a durable record of machines a provider created that no computer stores yet. */
+  unreferencedMachines?: UnreferencedMachineRecords;
   daytonaApiKey?: string;
   daytonaApiUrl?: string;
   daytonaTarget?: string;
@@ -41,6 +40,7 @@ export interface SandboxProviderOptions {
   boatApiUrl?: string;
   boxdApiKey?: string;
   boxdOrg?: string;
+  instaboxApiKey?: string;
   kubernetesNamespace?: string;
   kubernetesRuntimeClassName?: string;
   kubernetesComputerImage?: string;
@@ -61,6 +61,10 @@ export interface SandboxProviderOptions {
   incusCpuLimit?: string;
   incusMemoryLimit?: string;
   incusProcessLimit?: string;
+  localVmCli?: string;
+  localVmComputerImage?: string;
+  localVmCpus?: string;
+  localVmMemory?: string;
   wuyingAccessKeyId?: string;
   wuyingAccessKeySecret?: string;
   wuyingRegionId?: string;
@@ -79,6 +83,7 @@ function missingRemoteKey(
     | "createos"
     | "boat"
     | "boxd"
+    | "instabox"
     | "railway"
     | "incus"
     | "wuying",
@@ -97,7 +102,7 @@ export async function createSandboxProvider(
   const parsed = SandboxKind.safeParse(kind);
   if (!parsed.success) {
     throw new Error(
-      `Unknown SANDBOX_PROVIDER "${kind}". Use none | docker | e2b | novita | daytona | createos | boat | boxd | railway | kubernetes | incus | wuying | desktop | fake.`,
+      `Unknown SANDBOX_PROVIDER "${kind}". Use none | docker | e2b | novita | daytona | createos | boat | boxd | instabox | railway | kubernetes | incus | local-vm | wuying | desktop | fake.`,
     );
   }
   const sandboxKind = parsed.data;
@@ -114,13 +119,16 @@ export async function createSandboxProvider(
         template: opts.sandboxTemplate,
         onUnsafeStop: opts.onUnsafeStop,
       });
-    case "daytona":
+    case "daytona": {
       if (!opts.daytonaApiKey?.trim()) return missingRemoteKey("daytona", "DAYTONA_API_KEY");
-      return new DaytonaSandboxProvider({
+      const { createDaytonaSandboxProvider } = await import("./daytona-sandbox.js");
+      return createDaytonaSandboxProvider({
         apiKey: opts.daytonaApiKey,
         apiUrl: opts.daytonaApiUrl,
         target: opts.daytonaTarget,
+        unreferencedMachines: opts.unreferencedMachines,
       });
+    }
     case "createos":
       if (!opts.createosApiKey?.trim())
         return missingRemoteKey("createos", "CREATEOS_SANDBOX_API_KEY");
@@ -129,13 +137,35 @@ export async function createSandboxProvider(
         baseUrl: opts.createosBaseUrl,
         shape: opts.createosShape,
         rootfs: opts.createosRootfs,
+        unreferencedMachines: opts.unreferencedMachines,
       });
-    case "boat":
+    case "boat": {
       if (!opts.boatApiKey?.trim()) return missingRemoteKey("boat", "BOAT_API_KEY");
-      return new BoatSandboxProvider({ apiKey: opts.boatApiKey, apiUrl: opts.boatApiUrl });
-    case "boxd":
+      const { BoatSandboxProvider } = await import("./boat-sandbox.js");
+      return new BoatSandboxProvider({
+        apiKey: opts.boatApiKey,
+        apiUrl: opts.boatApiUrl,
+        unreferencedMachines: opts.unreferencedMachines,
+      });
+    }
+    case "boxd": {
       if (!opts.boxdApiKey?.trim()) return missingRemoteKey("boxd", "BOXD_API_KEY");
-      return new BoxdSandboxProvider({ apiKey: opts.boxdApiKey, org: opts.boxdOrg });
+      const { createBoxdSandboxProvider } = await import("./boxd-sandbox.js");
+      return createBoxdSandboxProvider({
+        apiKey: opts.boxdApiKey,
+        org: opts.boxdOrg,
+        unreferencedMachines: opts.unreferencedMachines,
+      });
+    }
+    case "instabox": {
+      if (!opts.instaboxApiKey?.trim()) return missingRemoteKey("instabox", "INSTABOX_API_KEY");
+      const { InstaboxSandboxProvider } = await import("./instabox-sandbox.js");
+      return new InstaboxSandboxProvider({
+        apiKey: opts.instaboxApiKey,
+        onUnsafeStop: opts.onUnsafeStop,
+        unreferencedMachines: opts.unreferencedMachines,
+      });
+    }
     case "railway":
       if (!opts.railwayApiToken?.trim()) return missingRemoteKey("railway", "RAILWAY_API_TOKEN");
       if (!opts.railwayEnvironmentId?.trim())
@@ -145,6 +175,7 @@ export async function createSandboxProvider(
         environmentId: opts.railwayEnvironmentId,
         maxWorkspaceFileBytes: opts.railwayMaxWorkspaceFileBytes,
         region: opts.railwaySandboxRegion,
+        unreferencedMachines: opts.unreferencedMachines,
       });
     case "kubernetes":
       return new KubernetesSandboxProvider({
@@ -178,6 +209,16 @@ export async function createSandboxProvider(
         cpuLimit: opts.incusCpuLimit,
         memoryLimit: opts.incusMemoryLimit,
         processLimit: opts.incusProcessLimit,
+        unreferencedMachines: opts.unreferencedMachines,
+      });
+    }
+    case "local-vm": {
+      const { AppleContainerSandboxProvider } = await import("./apple-container-sandbox.js");
+      return new AppleContainerSandboxProvider({
+        cli: opts.localVmCli,
+        computerImage: opts.localVmComputerImage,
+        cpus: opts.localVmCpus,
+        memory: opts.localVmMemory,
       });
     }
     case "wuying": {
@@ -218,7 +259,7 @@ export async function createSandboxProvider(
     default: {
       const _exhaustive: never = sandboxKind;
       throw new Error(
-        `Unknown SANDBOX_PROVIDER "${_exhaustive}". Use none | docker | e2b | novita | daytona | createos | boat | boxd | railway | kubernetes | incus | wuying | desktop | fake.`,
+        `Unknown SANDBOX_PROVIDER "${_exhaustive}". Use none | docker | e2b | novita | daytona | createos | boat | boxd | instabox | railway | kubernetes | incus | local-vm | wuying | desktop | fake.`,
       );
     }
   }

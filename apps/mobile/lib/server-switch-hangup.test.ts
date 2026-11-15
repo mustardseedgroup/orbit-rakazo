@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 
+vi.mock("./haptics", () => ({ hapticImpact: vi.fn(), hapticSuccess: vi.fn() }));
 vi.mock("./ai-consent", () => ({ promptAiConsent: vi.fn() }));
 // Dictation reads the platform; the rest of react-native stays unloaded.
 vi.mock("react-native", () => ({ Platform: { OS: "ios" } }));
@@ -29,11 +30,13 @@ vi.mock("./call-sounds", () => ({
 }));
 vi.mock("./voice", () => ({
   createSpeechOwner: () => Symbol("SpeechOwner"),
+  setCallAudio: vi.fn(async () => undefined),
+  setDictationAudio: vi.fn(async () => undefined),
   speakText: vi.fn(),
   stopSpeaking: vi.fn(),
 }));
 
-import { resetApiBase, saveApiBase } from "./api";
+import { resetApiBase, saveApiBase } from "./api-server";
 import type { CallDeps } from "./call-session";
 import { startCall } from "./call-session";
 import { currentSessionGeneration, saveSessionToken } from "./session";

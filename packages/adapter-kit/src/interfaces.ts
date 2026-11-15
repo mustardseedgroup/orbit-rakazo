@@ -72,9 +72,11 @@ import type {
   SecretPutOptions,
   SecretRecord,
   SemanticMemoryCapabilities,
+  SemanticMemoryConversationRequest,
   SemanticMemoryForgetRequest,
   SemanticMemoryPurgeHistoryRequest,
   SemanticMemoryRecallRequest,
+  SemanticMemoryReflectRequest,
   SemanticMemoryResponse,
   SemanticMemoryResult,
   SemanticMemorySaveRequest,
@@ -83,6 +85,7 @@ import type {
   StreamedPortableFile,
   TerminalRequest,
   TransactionalEmail,
+  UnreferencedMachine,
   VoiceCapabilities,
   VoiceInfo,
   VoiceSynthesizeRequest,
@@ -142,6 +145,13 @@ export interface SandboxProvider {
        * the provider cannot move to throws `SandboxSizeUnavailableError`.
        */
       size?: ComputerSize;
+      /**
+       * The owner's IANA time zone (`Europe/Warsaw`) and app language (`pl`, `pt-BR`), for the
+       * computer's clock and browser. Absent when unknown: the provider keeps its defaults.
+       * Values are not validated here; a provider ignores one it cannot use.
+       */
+      timezone?: string;
+      language?: string;
     },
     context: AdapterContext,
   ): Promise<ComputerRef>;
@@ -250,6 +260,23 @@ export interface SandboxProvider {
     options?: { discardUnsaved?: boolean },
   ): Promise<void>;
   destroy(computer: ComputerRef, context: AdapterContext): Promise<void>;
+  /**
+   * Deletes a machine no stored computer points at, from its id alone. Resolves once it is gone,
+   * which includes never having existed; rejects when the provider could not be asked.
+   */
+  deleteMachine?(machine: UnreferencedMachine, signal: AbortSignal): Promise<void>;
+}
+
+/**
+ * Where a provider records the machines no stored computer points at, so that one it could not
+ * delete, or one left by a process that died, is deleted later. Supplied where providers are
+ * built; a provider built without it only deletes and logs.
+ */
+export interface UnreferencedMachineRecords {
+  /** Records the machine, or moves its record: it is deleted at `deleteAt` unless a computer stores it first. */
+  record(machine: UnreferencedMachine, deleteAt: Date): Promise<void>;
+  /** Drops the record of a machine that is gone. */
+  clear(machine: UnreferencedMachine): Promise<void>;
 }
 
 export interface ConnectorProvider {
@@ -284,7 +311,11 @@ export interface ManagedConnectorProvider
   extends ConnectorProvider,
     Omit<ConnectionAuthProvider, "describe"> {
   catalog(context: AdapterContext, query?: string): Promise<ConnectorCatalogItem[]>;
+  /** The actions one app offers, to show people what connecting it gives bots. */
+  listAppTools?(context: AdapterContext, externalId: string): Promise<ConnectorTool[]>;
   listConnectedExternalIds(context: AdapterContext): Promise<string[]>;
+  /** Whether a connected app needs reconnecting because its saved connection gives this run no tools. */
+  needsReconnect?(context: AdapterContext, externalId: string): Promise<boolean>;
   /** Connection refs the provider reports as dead until the user reconnects them. */
   listReconnectRefs?(context: AdapterContext): Promise<string[]>;
   connectionReady(context: AdapterContext, externalId: string): Promise<boolean>;
@@ -326,6 +357,8 @@ export interface MemoryStore {
 
 /** Optional semantic memory. Durable Markdown memory remains owned by MemoryStore. */
 export interface SemanticMemoryProvider {
+  /** Required by retainConversation: an opaque version that changes with endpoint or credentials. */
+  readonly connectionIdentity?: string;
   describe(): AdapterDescriptor<SemanticMemoryCapabilities>;
   recall(
     request: SemanticMemoryRecallRequest,
@@ -344,6 +377,26 @@ export interface SemanticMemoryProvider {
     request: SemanticMemoryForgetRequest,
     context: AdapterContext,
   ): Promise<SemanticMemoryResponse<{ id: string; expired: boolean; reason: string | null }>>;
+  /**
+   * Optional: learn from one finished turn of a bot's conversation. Resolves once the turn is
+   * submitted. `pending` is an opaque token while the provider is still storing it: poll
+   * `retainedConversationSettled` with it until settled, so a purgeHistory after that removes the
+   * turn. A provider that can return `pending` must implement `retainedConversationSettled`.
+   */
+  retainConversation?(
+    request: SemanticMemoryConversationRequest,
+    context: AdapterContext,
+  ): Promise<SemanticMemoryResponse<{ pending?: string }>>;
+  /** Optional: whether a turn `retainConversation` answered with `pending` is stored now. */
+  retainedConversationSettled?(
+    pending: string,
+    context: AdapterContext,
+  ): Promise<SemanticMemoryResponse<{ settled: boolean }>>;
+  /** Optional: answer a question by reasoning over the bot's memory. */
+  reflect?(
+    request: SemanticMemoryReflectRequest,
+    context: AdapterContext,
+  ): Promise<SemanticMemoryResponse<string>>;
 }
 
 export interface AgentRuntime {
@@ -360,8 +413,17 @@ export interface ModelProvider {
   listModels(): Promise<Array<{ provider: string; id: string; label: string; billing: string }>>;
 }
 
+/** An open database transaction a job can be written in, so the job exists only if it commits. */
+export interface JobTransaction {
+  $executeRawUnsafe(query: string, ...values: unknown[]): PromiseLike<unknown>;
+}
+
 export interface JobPublisher {
   enqueue(job: BackgroundJob): Promise<void>;
+  /** Adds the job, or replaces the one with its key, as part of the caller's transaction. */
+  enqueueIn(tx: JobTransaction, job: BackgroundJob): Promise<void>;
+  /** Removes the keyed job as part of the caller's transaction. */
+  cancelIn(tx: JobTransaction, key: string): Promise<void>;
   cancel(key: string): Promise<void>;
   close(): Promise<void>;
 }
@@ -454,6 +516,8 @@ export interface SecretStore {
   load(ref: string, context: SecretContext): Promise<string>;
   /** Inline encrypted refs have no remote resource; removal is owned by persistence. */
   delete(ref: string, context: SecretContext): Promise<void>;
+  /** Whether the ref names a remote resource, which stays until `delete` removes it. */
+  isRemote(ref: string): boolean;
   redact(value: string): string;
   onChange(listener: SecretChangeListener): () => void;
   start(): Promise<void>;
@@ -526,6 +590,8 @@ export interface BillingProvider {
   getPrice(): Promise<BillingPrice>;
   createCustomer(input: { email: string; organizationId: string }): Promise<{ customerId: string }>;
   createCheckout(input: BillingCheckoutRequest): Promise<{ url: string }>;
+  /** Expires every open checkout session of the customer; resolves once none can be paid. */
+  expireOpenCheckouts(customerId: string): Promise<void>;
   createPortal(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
   /** Current subscription for the customer, preferring one that grants access. */
   getCustomerSubscription(customerId: string): Promise<BillingSubscriptionSnapshot | null>;
@@ -544,7 +610,12 @@ export interface ExecutionRunner {
 export interface VoiceProvider {
   describe(): AdapterDescriptor<VoiceCapabilities>;
   verify(apiKey: string, context: AdapterContext): Promise<VoiceVerifyResult>;
-  listVoices(apiKey: string, context: AdapterContext): Promise<VoiceInfo[]>;
+  /** `options.language` narrows the listing for providers that advertise `languages`. */
+  listVoices(
+    apiKey: string,
+    context: AdapterContext,
+    options?: { language?: string },
+  ): Promise<VoiceInfo[]>;
   synthesize(request: VoiceSynthesizeRequest, context: AdapterContext): Promise<SpeechClip>;
   transcribe?(request: VoiceTranscribeRequest, context: AdapterContext): Promise<{ text: string }>;
 }
