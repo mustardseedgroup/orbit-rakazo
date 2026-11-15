@@ -1,12 +1,14 @@
 import { getHeapStatistics } from "node:v8";
-import type { BackgroundJobHandlers } from "@rakazo/adapter-kit";
 import {
   HISTORY_COMPACT_MAX_ATTEMPTS,
   historyCompactJob,
-  messagingDeliverJob,
+  messagingReplyJob,
+  teamChatAmbientJob,
 } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
+import { DatabaseOutage, databaseCapacityBackoffMs } from "@rakazo/db";
 import { createLogger, createTestSink, installLogger, wrapJobPayload } from "@rakazo/logging";
+import type * as GraphileWorker from "graphile-worker";
 import type { Runner } from "graphile-worker";
 import { makeWorkerUtils } from "graphile-worker";
 import type { Pool } from "pg";
@@ -22,7 +24,8 @@ vi.mock("node:v8", () => ({
   })),
 }));
 
-vi.mock("graphile-worker", () => ({
+vi.mock("graphile-worker", async (importOriginal) => ({
+  ...(await importOriginal<typeof GraphileWorker>()),
   run: (...args: unknown[]) => run(...args),
   makeWorkerUtils: vi.fn(),
 }));
@@ -31,62 +34,17 @@ import { RunExecutionHost } from "./run-execution.js";
 import {
   createReservedGraphileJobWorkerHost,
   createRoutineRetryNoticeReconciler,
-  databaseCapacityBackoffMs,
   GraphileJobPublisher,
   GraphileJobWorkerHost,
 } from "./wakeup.js";
-
-function handlers(): BackgroundJobHandlers {
-  return {
-    "run.continue": vi.fn(async () => undefined),
-    "routine.wakeup": vi.fn(async () => undefined),
-    "routine.retry": vi.fn(async () => undefined),
-    "computer.update": vi.fn(async () => undefined),
-    "computer.sleep": vi.fn(async () => undefined),
-    "computer.control-expire": vi.fn(async () => undefined),
-    "skill.teaching-expire": vi.fn(async () => undefined),
-    "call.expire": vi.fn(async () => undefined),
-    "history.compact": vi.fn(async () => undefined),
-    "messaging.deliver": vi.fn(async () => undefined),
-    "messaging.credential-cleanup": vi.fn(async () => undefined),
-    "cloud_agent.poll": vi.fn(async () => undefined),
-    "purchase.poll": vi.fn(async () => undefined),
-    "media.poll": vi.fn(async () => undefined),
-    "push.receipt": vi.fn(async () => undefined),
-  };
-}
-
-function deferred() {
-  let resolve!: () => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<void>((yes, no) => {
-    resolve = yes;
-    reject = no;
-  });
-  return { promise, resolve, reject };
-}
-
-function mockRunner() {
-  const life = deferred();
-  // Keep a rejection handler so Node does not treat the mock lifecycle as an
-  // unexpected unhandledRejection before the host attaches supervise().
-  life.promise.catch(() => undefined);
-  const runner = {
-    promise: life.promise,
-    stop: vi.fn(async () => {
-      life.resolve();
-    }),
-    kill: vi.fn(async () => undefined),
-    addJob: vi.fn(),
-    events: { on: vi.fn(), off: vi.fn(), once: vi.fn(), emit: vi.fn() },
-  } as unknown as Runner;
-  return {
-    runner,
-    rejectLife: (error: unknown) => life.reject(error),
-  };
-}
-
-const tooMany = Object.assign(new Error("sorry, too many clients already"), { code: "53300" });
+import {
+  deferred,
+  handlers,
+  helpers,
+  mockRunner,
+  settles,
+  tooMany,
+} from "./wakeup-graphile-host.test-support.js";
 
 describe("databaseCapacityBackoffMs", () => {
   it("matches the worker startup backoff curve", () => {
@@ -148,15 +106,26 @@ describe("GraphileJobPublisher.enqueue", () => {
   it("leaves the queue default when the job sets no cap", async () => {
     const addJob = vi.fn(async (..._args: unknown[]) => undefined);
     const publisher = publisherWith(addJob);
-    await publisher.enqueue(messagingDeliverJob("run-1"));
+    await publisher.enqueue(messagingReplyJob("run-1"));
     const options = addJob.mock.calls[0]?.[2] as { maxAttempts?: number } | undefined;
     expect(options?.maxAttempts).toBeUndefined();
     await publisher.close();
   });
 
+  it("forwards the job's queue so one conversation's jobs run one at a time", async () => {
+    const addJob = vi.fn(async (..._args: unknown[]) => undefined);
+    const publisher = publisherWith(addJob);
+    await publisher.enqueue(teamChatAmbientJob("conversation-1", new Date()));
+    await publisher.enqueue(historyCompactJob("thread-1"));
+    expect(
+      addJob.mock.calls.map(([, , spec]) => (spec as { queueName?: string }).queueName),
+    ).toEqual(["team_chat.ambient:conversation-1", undefined]);
+    await publisher.close();
+  });
+
   type KeyedJob = { attempts: number; maxAttempts: number; runAt: Date; lockedAt?: Date };
 
-  // graphile-worker 0.17.3 add_job: unsafe_dedupe on conflict bumps revision only.
+  // graphile-worker add_job: unsafe_dedupe on conflict bumps revision only.
   // replace sets attempts = 0 and run_at = excluded.run_at, or detaches a locked
   // job and inserts a new one.
   function graphileJobs(jobs: Map<string, KeyedJob>) {
@@ -378,13 +347,14 @@ describe("reserved Graphile workloads", () => {
       for (let cycle = 0; cycle < 2; cycle++) {
         await host.start(target);
         const background = run.mock.calls[cycle * 3 + 1]?.[0].taskList;
-        await background["run.continue"](wrapJobPayload({ runId: "legacy-chat" }));
+        await background["run.continue"](wrapJobPayload({ runId: "legacy-chat" }), helpers);
         await host.stop();
       }
       expect(target["run.continue"]).toHaveBeenCalledTimes(2);
       expect(target["run.continue"]).toHaveBeenLastCalledWith(
         { runId: "legacy-chat" },
         { onRunStarted: expect.any(Function) },
+        { number: 1, max: 25 },
       );
     } finally {
       await host.stop();
@@ -411,6 +381,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
   });
 
   it("stops waiting for a handed-off run that outlives the drain deadline", async () => {
+    vi.useFakeTimers();
     run.mockResolvedValueOnce(mockRunner().runner);
     const host = new GraphileJobWorkerHost({} as Pool, { concurrency: 1, drainTimeoutMs: 20 });
     const hung = deferred();
@@ -421,8 +392,12 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     };
     try {
       await host.start(target);
-      await run.mock.calls[0]![0].taskList["run.continue"]({ runId: "hung-run" });
-      await host.stop();
+      await run.mock.calls[0]![0].taskList["run.continue"]({ runId: "hung-run" }, helpers);
+      const stopped = settles(host.stop());
+      await vi.advanceTimersByTimeAsync(19);
+      expect(stopped.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(stopped.settled).toBe(true);
     } finally {
       hung.resolve();
     }
@@ -443,7 +418,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
       await host.start(target);
       const dispatch = run.mock.calls[0]![0].taskList["run.continue"];
       await Promise.all(
-        Array.from({ length: 5 }, (_, index) => dispatch({ runId: `run-${index}` })),
+        Array.from({ length: 5 }, (_, index) => dispatch({ runId: `run-${index}` }, helpers)),
       );
       expect(started).toBe(5);
       let stopped = false;
@@ -475,10 +450,10 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     try {
       await host.start(target);
       const dispatch = run.mock.calls[0]![0].taskList["run.continue"];
-      await dispatch({ runId: "0" });
-      await dispatch({ runId: "1" });
+      await dispatch({ runId: "0" }, helpers);
+      await dispatch({ runId: "1" }, helpers);
       vi.mocked(process.availableMemory).mockReturnValue(40 * 1024 ** 2);
-      const third = dispatch({ runId: "2" });
+      const third = dispatch({ runId: "2" }, helpers);
       expect(entered).toEqual(["0", "1"]);
       vi.mocked(process.availableMemory).mockReturnValue(64 * 1024 ** 2);
       releases[0]!.resolve();
@@ -677,7 +652,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     try {
       await host.start(target);
       await expect(
-        run.mock.calls[0]![0].taskList["run.continue"]({ runId: "setup-failure" }),
+        run.mock.calls[0]![0].taskList["run.continue"]({ runId: "setup-failure" }, helpers),
       ).rejects.toBe(error);
     } finally {
       await host.stop();
@@ -699,9 +674,9 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     try {
       await host.start(target);
       const dispatch = run.mock.calls[0]![0].taskList["run.continue"];
-      await dispatch({ runId: "first" });
+      await dispatch({ runId: "first" }, helpers);
       vi.mocked(process.availableMemory).mockReturnValue(40 * 1024 ** 2);
-      const second = dispatch({ runId: "second" });
+      const second = dispatch({ runId: "second" }, helpers);
       expect(entered).toBe(1);
       vi.mocked(process.availableMemory).mockReturnValue(64 * 1024 ** 2);
       await vi.advanceTimersByTimeAsync(1_000);
@@ -726,7 +701,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     };
     try {
       await host.start(target);
-      await run.mock.calls[0]![0].taskList["run.continue"]({ runId: "late-failure" });
+      await run.mock.calls[0]![0].taskList["run.continue"]({ runId: "late-failure" }, helpers);
       lateFailure.reject(new Error("fixture execution failure"));
       await host.stop();
       expect(sink.events.filter((event) => event.level === "error")).toEqual([
@@ -743,7 +718,20 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     }
   });
 
-  it("backs off then restarts when runner.promise rejects with 53300", async () => {
+  it.each([
+    ["out of connections", tooMany],
+    [
+      "read-only during a failover",
+      Object.assign(new Error("cannot execute UPDATE in a read-only transaction"), {
+        code: "25006",
+      }),
+    ],
+    [
+      "refusing connections",
+      Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" }),
+    ],
+    ["dropping its connection", new Error("Connection terminated unexpectedly")],
+  ])("backs off then restarts when the runner stops with the database %s", async (_, error) => {
     const first = mockRunner();
     const second = mockRunner();
     run.mockResolvedValueOnce(first.runner).mockResolvedValueOnce(second.runner);
@@ -752,12 +740,13 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
       sleep: async (ms) => {
         sleeps.push(ms);
       },
+      outage: new DatabaseOutage(),
     });
 
     await host.start(handlers());
     expect(run).toHaveBeenCalledTimes(1);
 
-    first.rejectLife(tooMany);
+    first.rejectLife(error);
     await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
     expect(sleeps).toEqual([200]);
 
@@ -808,7 +797,7 @@ describe("GraphileJobWorkerHost runner lifecycle", () => {
     expect(recovered.runner.stop).toHaveBeenCalled();
   });
 
-  it("does not restart when runner.promise rejects for a non-53300 error", async () => {
+  it("does not restart when the runner fails for a reason other than the database", async () => {
     const first = mockRunner();
     run.mockResolvedValueOnce(first.runner);
     const host = new GraphileJobWorkerHost({} as Pool, {

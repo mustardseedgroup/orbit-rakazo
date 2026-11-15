@@ -12,6 +12,9 @@ function subscribe(channel) {
 contextBridge.exposeInMainWorld("rakazoDesktop", {
   platform: process.platform,
   nativeWindowFrame: process.platform === "win32",
+  clipboard: {
+    writeText: (text) => ipcRenderer.invoke("desktop.clipboard.write", text),
+  },
   badge: {
     set: (count) => ipcRenderer.invoke("desktop.badge.set", count),
   },
@@ -85,6 +88,15 @@ contextBridge.exposeInMainWorld("rakazoDesktop", {
       const handler = (_event, callback) => listener(callback);
       ipcRenderer.on("desktop.oauth.callback", handler);
       return () => ipcRenderer.off("desktop.oauth.callback", handler);
+    },
+  },
+  mcpBrowser: {
+    clear: (serverId) => ipcRenderer.invoke("desktop.mcpBrowser.clear", serverId),
+    onOAuthCallback: (listener) => {
+      // The IpcRendererEvent stays in the preload: the renderer only sees the code.
+      const handler = (_event, callback) => listener(callback);
+      ipcRenderer.on("desktop.mcpBrowser.callback", handler);
+      return () => ipcRenderer.off("desktop.mcpBrowser.callback", handler);
     },
   },
 });

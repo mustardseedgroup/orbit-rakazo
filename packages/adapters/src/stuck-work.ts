@@ -1,5 +1,4 @@
 import type { JobPublisher, NotificationMessage, NotificationProvider } from "@rakazo/adapter-kit";
-import { runContinueJob } from "@rakazo/adapter-kit";
 import type { StuckWorkStatus } from "@rakazo/core";
 import {
   isStuckWorkStatus,
@@ -12,11 +11,17 @@ import {
   stuckWorkStoppedNotification,
 } from "@rakazo/core";
 import type { Prisma, PrismaClient, ThreadEvents } from "@rakazo/db";
-import { appendEventInTransaction, expireStuckRun, withTransactionRetry } from "@rakazo/db";
+import {
+  appendEventInTransaction,
+  expireStuckRun,
+  THREAD_LOCK_TRANSACTION_OPTIONS,
+  withTransactionRetry,
+} from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { ExpoPushProvider } from "./expo-push.js";
 import { notificationIdentity } from "./notification-identity.js";
 import { publishChatAlert } from "./run-notifications.js";
+import { wakeRun } from "./wake-run.js";
 
 type StuckCursor = { at: Date; id: string };
 
@@ -209,7 +214,10 @@ async function remindStuckRun(
   if (!deps.notifications || !noticesEnabled(run)) return;
   if (!(await pushCanDeliver(deps.notifications, run.userId))) return;
   const claimId = await withTransactionRetry(() =>
-    deps.prisma.$transaction((tx) => claimStuckReminder(tx, run, deps.now)),
+    deps.prisma.$transaction(
+      (tx) => claimStuckReminder(tx, run, deps.now),
+      THREAD_LOCK_TRANSACTION_OPTIONS,
+    ),
   );
   if (!claimId) return;
   const reminder = stuckWorkReminder(run.status, run.bot.name);
@@ -225,7 +233,10 @@ async function remindStuckRun(
     // After the push, so a failed push that is retried does not alert open apps twice.
     publishChatAlert(deps.events, run, message, run.thread.groupId);
     await withTransactionRetry(() =>
-      deps.prisma.$transaction((tx) => markStuckNoticeDelivered(tx, claimId, run)),
+      deps.prisma.$transaction(
+        (tx) => markStuckNoticeDelivered(tx, claimId, run),
+        THREAD_LOCK_TRANSACTION_OPTIONS,
+      ),
     );
     return;
   }
@@ -323,25 +334,24 @@ async function expireOne(
   run: StuckCandidate,
 ) {
   const expired = await withTransactionRetry(() =>
-    deps.prisma.$transaction((tx) =>
-      expireStuckRun(tx, {
-        runId: run.id,
-        threadId: run.threadId,
-        status: run.status,
-        updatedAt: run.updatedAt,
-        now: deps.now,
-      }),
+    deps.prisma.$transaction(
+      (tx) =>
+        expireStuckRun(tx, {
+          runId: run.id,
+          threadId: run.threadId,
+          status: run.status,
+          updatedAt: run.updatedAt,
+          now: deps.now,
+        }),
+      THREAD_LOCK_TRANSACTION_OPTIONS,
     ),
   );
   if (!expired) return;
   await deps.events?.notify(run.threadId, expired.seq).catch((error) => {
     getLogger().error("stuck work realtime notification", error);
   });
-  if (expired.continuationRunId) {
-    await deps.jobs.enqueue(runContinueJob(expired.continuationRunId)).catch((error) => {
-      getLogger().error("stuck work continuation", error);
-    });
-  }
+  await deps.events?.publishSpaceChange?.(run.spaceId, "runs");
+  if (expired.continuationRunId) await wakeRun(deps.jobs, expired.continuationRunId);
   if (!noticesEnabled(run)) return;
   const stopped = stuckWorkStoppedNotification(run.status, run.bot.name);
   const message = {
